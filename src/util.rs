@@ -44,6 +44,33 @@ impl<T> LogConfig<T> {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetricConfig {
+    pub namespace: String,
+    pub dimensions: Vec<(String, String)>,
+    pub metric_name: String,
+    pub metric_unit: String,
+    pub metric_value: f64,
+}
+
+impl MetricConfig {
+    pub fn new(
+        namespace: impl Into<String>,
+        dimensions: Vec<(String, String)>,
+        metric_name: impl Into<String>,
+        metric_unit: impl Into<String>,
+        metric_value: f64,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            dimensions,
+            metric_name: metric_name.into(),
+            metric_unit: metric_unit.into(),
+            metric_value,
+        }
+    }
+}
+
 pub struct LogsUtil<T: Serialize + Send + Sync> {
     pub backend: Arc<dyn LogsBackend>,
     pub config: LogConfig<T>,
@@ -223,15 +250,7 @@ impl<T: Serialize + Send + Sync> LogsUtil<T> {
         }
     }
 
-    pub async fn log_emf(
-        &mut self,
-        item: T,
-        namespace: impl Into<String>,
-        dimensions: Vec<(String, String)>,
-        metric_name: impl Into<String>,
-        metric_unit: impl Into<String>,
-        metric_value: f64,
-    ) -> Result<(), ServerError> {
+    pub async fn log_emf(&mut self, item: T, metric: MetricConfig) -> Result<(), ServerError> {
         #[derive(Serialize)]
         struct EmfRoot<P> {
             #[serde(rename = "_aws")]
@@ -261,12 +280,12 @@ impl<T: Serialize + Send + Sync> LogsUtil<T> {
 
         // Build EMF structure.
         let timestamp_ms = chrono::Utc::now().timestamp_millis();
-        let namespace_str = namespace.into();
+        let namespace_str = metric.namespace.clone();
         let metric_def = EmfMetricDefinition {
-            Name: metric_name.into(),
-            Unit: metric_unit.into(),
+            Name: metric.metric_name.clone(),
+            Unit: metric.metric_unit.clone(),
         };
-        let dims_keys: Vec<String> = dimensions.iter().map(|(k, _)| k.clone()).collect();
+        let dims_keys: Vec<String> = metric.dimensions.iter().map(|(k, _)| k.clone()).collect();
 
         // Merge item with dimension key-values. Wrap user item in an object
         // that also includes the dimensions as fields.
@@ -275,9 +294,11 @@ impl<T: Serialize + Send + Sync> LogsUtil<T> {
             CloudWatchInvalidOperation::with_debug("failed to serialize EMF payload", &e)
         })?;
         if let serde_json::Value::Object(ref mut map) = base {
-            for (k, v) in &dimensions {
+            for (k, v) in &metric.dimensions {
                 map.insert(k.clone(), json!(v));
             }
+            // Include the actual metric value under the metric name per EMF spec.
+            map.insert(metric.metric_name.clone(), json!(metric.metric_value));
         }
 
         let emf = EmfRoot {
