@@ -1,24 +1,26 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use aws_sdk_cloudwatchlogs::{
     error::SdkError,
     operation::{
-        create_log_stream::CreateLogStreamError,
-        describe_log_streams::DescribeLogStreamsError,
-        put_log_events::PutLogEventsError,
+        create_log_stream::CreateLogStreamError, describe_log_streams::DescribeLogStreamsError,
     },
     types::InputLogEvent,
 };
-use backend::LogsBackend;
-use fractic_server_error::ServerError;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{
     errors::{CloudWatchCalloutError, CloudWatchInvalidOperation, LogGroupNotFound},
     LogsCtxView,
 };
+use fractic_server_error::{CriticalError, ServerError};
 
 pub mod backend;
+use backend::LogsBackend;
+
+/// Configuration.
+/// --------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StreamNaming {
@@ -33,7 +35,6 @@ pub struct LogConfig<T> {
     #[serde(skip)]
     pub _phantom: std::marker::PhantomData<T>,
 }
-
 impl<T> LogConfig<T> {
     pub fn new(log_group: impl Into<String>, stream_naming: StreamNaming) -> Self {
         Self {
@@ -44,213 +45,62 @@ impl<T> LogConfig<T> {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MetricConfig {
-    pub namespace: String,
-    pub dimensions: Vec<(String, String)>,
-    pub metric_name: String,
-    pub metric_unit: String,
-    pub metric_value: f64,
+/// Extensions.
+/// --------------------------------------------------------------------------
+
+/// Implement on T to enable EMF logging.
+pub trait MetricExport {
+    fn metric_namespace(&self) -> &str;
+    fn metric_dimensions(&self) -> HashMap<String, String>;
+    fn metric_name(&self) -> &str;
+    fn metric_unit(&self) -> &str;
+    fn metric_value(&self) -> f64;
 }
 
-impl MetricConfig {
-    pub fn new(
-        namespace: impl Into<String>,
-        dimensions: Vec<(String, String)>,
-        metric_name: impl Into<String>,
-        metric_unit: impl Into<String>,
-        metric_value: f64,
-    ) -> Self {
-        Self {
-            namespace: namespace.into(),
-            dimensions,
-            metric_name: metric_name.into(),
-            metric_unit: metric_unit.into(),
-            metric_value,
-        }
-    }
-}
+/// Implementation.
+/// --------------------------------------------------------------------------
 
 pub struct LogsUtil<T: Serialize + Send + Sync> {
     pub backend: Arc<dyn LogsBackend>,
     pub config: LogConfig<T>,
-
-    /// For UUID-based stream naming, reuse the same stream for the lifetime of
-    /// the util.
-    uuid_stream_name: Option<String>,
+    stream_name: String,
 }
 
 impl<T: Serialize + Send + Sync> LogsUtil<T> {
     pub async fn new(ctx: &dyn LogsCtxView, config: LogConfig<T>) -> Result<Self, ServerError> {
+        let backend = ctx.logs_backend().await?;
+        let stream_name = ensure_stream(&*backend, &config).await?;
         Ok(Self {
-            backend: ctx.logs_backend().await?,
+            backend,
             config,
-            uuid_stream_name: None,
+            stream_name,
         })
     }
 
-    fn compute_stream_name(&self) -> String {
-        match self.config.stream_naming {
-            StreamNaming::Date => chrono::Utc::now().format("%Y-%m-%d").to_string(),
-            StreamNaming::Uuid => self
-                .uuid_stream_name
-                .clone()
-                .unwrap_or_else(|| format!("{}", uuid::Uuid::new_v4())),
-        }
-    }
-
-    async fn ensure_stream(&mut self, stream_name: &str) -> Result<(), ServerError> {
-        let desc = self
-            .backend
-            .describe_log_stream(
-                self.config.log_group.clone(),
-                stream_name.to_string(),
-            )
-            .await;
-
-        match desc {
-            Ok(output) => {
-                let exists = output
-                    .log_streams()
-                    .iter()
-                    .any(|s| s.log_stream_name() == Some(stream_name));
-                if exists {
-                    return Ok(());
-                }
-
-                // Stream missing; attempt to create it.
-                self
-                    .backend
-                    .create_log_stream(
-                        self.config.log_group.clone(),
-                        stream_name.to_string(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|err| match err {
-                        SdkError::ServiceError(se) => match se.err() {
-                            CreateLogStreamError::ResourceNotFoundException(_) =>
-                                LogGroupNotFound::new(&self.config.log_group),
-                            _ => CloudWatchCalloutError::with_debug(
-                                "failed to create log stream",
-                                &se.err().to_string(),
-                            ),
-                        },
-                        other => CloudWatchCalloutError::with_debug(
-                            "failed to create log stream",
-                            &other,
-                        ),
-                    })
-            }
-            Err(err) => match err {
-                SdkError::ServiceError(se) => match se.err() {
-                    DescribeLogStreamsError::ResourceNotFoundException(_) =>
-                        Err(LogGroupNotFound::new(&self.config.log_group)),
-                    _ => Err(CloudWatchCalloutError::with_debug(
-                        "failed to describe log stream",
-                        &se.err().to_string(),
-                    )),
-                },
-                other => Err(CloudWatchCalloutError::with_debug(
-                    "failed to describe log stream",
-                    &other,
-                )),
-            },
-        }
-    }
-
-    async fn fetch_sequence_token(
-        &self,
-        stream_name: &str,
-    ) -> Result<Option<String>, ServerError> {
-        let out = self
-            .backend
-            .describe_log_stream(
-                self.config.log_group.clone(),
-                stream_name.to_string(),
-            )
-            .await
-            .map_err(|e| match e {
-                SdkError::ServiceError(se) => match se.err() {
-                    DescribeLogStreamsError::ResourceNotFoundException(_) =>
-                        LogGroupNotFound::new(&self.config.log_group),
-                    _ => CloudWatchCalloutError::with_debug(
-                        "failed to describe log stream",
-                        &se.err().to_string(),
-                    ),
-                },
-                other => CloudWatchCalloutError::with_debug(
-                    "failed to describe log stream",
-                    &other,
-                ),
-            })?;
-        let token = out
-            .log_streams()
-            .first()
-            .and_then(|s| s.upload_sequence_token().map(|s| s.to_string()));
-        Ok(token)
-    }
-
-    pub async fn log(&mut self, item: T) -> Result<(), ServerError> {
-        let stream_name = match self.config.stream_naming {
-            StreamNaming::Date => self.compute_stream_name(),
-            StreamNaming::Uuid => {
-                if self.uuid_stream_name.is_none() {
-                    self.uuid_stream_name = Some(self.compute_stream_name());
-                }
-                self.uuid_stream_name.clone().unwrap()
-            }
-        };
-
-        self.ensure_stream(&stream_name).await?;
-
+    pub async fn log(&self, item: T) -> Result<(), ServerError> {
         let message = serde_json::to_string(&item).map_err(|e| {
             CloudWatchInvalidOperation::with_debug("failed to serialize log item", &e)
         })?;
-
         let event = InputLogEvent::builder()
             .message(message)
             .timestamp(chrono::Utc::now().timestamp_millis())
-            .build();
+            .build()
+            .map_err(|e| CloudWatchInvalidOperation::with_debug("failed to build log event", &e))?;
 
-        let mut sequence_token = self.fetch_sequence_token(&stream_name).await?;
-
-        // Retry once on InvalidSequenceToken: fetch latest token and retry.
-        let attempt = self
-            .backend
+        self.backend
             .put_log_events(
                 self.config.log_group.clone(),
-                stream_name.clone(),
-                vec![event.clone()],
-                sequence_token.clone(),
+                self.stream_name.clone(),
+                vec![event],
             )
-            .await;
-
-        match attempt {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("InvalidSequenceToken") || err_str.contains("DataAlreadyAccepted") {
-                    sequence_token = self.fetch_sequence_token(&stream_name).await?;
-                    self
-                        .backend
-                        .put_log_events(
-                            self.config.log_group.clone(),
-                            stream_name,
-                            vec![event],
-                            sequence_token,
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|e2| CloudWatchCalloutError::with_debug("failed to put log events (retry)", &e2))
-                } else {
-                    Err(CloudWatchCalloutError::with_debug("failed to put log events", &e))
-                }
-            }
-        }
+            .await
+            .map_err(|e| CloudWatchCalloutError::with_debug("failed to put log events", &e))?;
+        Ok(())
     }
+}
 
-    pub async fn log_emf(&mut self, item: T, metric: MetricConfig) -> Result<(), ServerError> {
+impl<T: Serialize + Send + Sync + MetricExport> LogsUtil<T> {
+    pub async fn log_emf(&self, item: T) -> Result<(), ServerError> {
         #[derive(Serialize)]
         struct EmfRoot<P> {
             #[serde(rename = "_aws")]
@@ -258,115 +108,137 @@ impl<T: Serialize + Send + Sync> LogsUtil<T> {
             #[serde(flatten)]
             payload: P,
         }
-
         #[derive(Serialize)]
+        #[allow(non_snake_case)]
         struct EmfAws {
             Timestamp: i64,
             CloudWatchMetrics: Vec<EmfMetricDirective>,
         }
-
         #[derive(Serialize)]
+        #[allow(non_snake_case)]
         struct EmfMetricDirective {
             Namespace: String,
-            Dimensions: Vec<Vec<String>>, // list of dimension sets
+            Dimensions: Vec<Vec<String>>,
             Metrics: Vec<EmfMetricDefinition>,
         }
-
         #[derive(Serialize)]
+        #[allow(non_snake_case)]
         struct EmfMetricDefinition {
             Name: String,
             Unit: String,
         }
 
-        // Build EMF structure.
-        let timestamp_ms = chrono::Utc::now().timestamp_millis();
-        let namespace_str = metric.namespace.clone();
-        let metric_def = EmfMetricDefinition {
-            Name: metric.metric_name.clone(),
-            Unit: metric.metric_unit.clone(),
-        };
-        let dims_keys: Vec<String> = metric.dimensions.iter().map(|(k, _)| k.clone()).collect();
+        let ts = chrono::Utc::now().timestamp_millis();
+        let dims = item.metric_dimensions();
+        let dims_keys: Vec<String> = dims.keys().cloned().collect();
 
-        // Merge item with dimension key-values. Wrap user item in an object
-        // that also includes the dimensions as fields.
-        use serde_json::json;
-        let mut base = serde_json::to_value(&item).map_err(|e| {
+        let mut payload = serde_json::to_value(&item).map_err(|e| {
             CloudWatchInvalidOperation::with_debug("failed to serialize EMF payload", &e)
         })?;
-        if let serde_json::Value::Object(ref mut map) = base {
-            for (k, v) in &metric.dimensions {
+        if let serde_json::Value::Object(ref mut map) = payload {
+            for (k, v) in &dims {
                 map.insert(k.clone(), json!(v));
             }
-            // Include the actual metric value under the metric name per EMF spec.
-            map.insert(metric.metric_name.clone(), json!(metric.metric_value));
+            map.insert(item.metric_name().to_string(), json!(item.metric_value()));
         }
 
         let emf = EmfRoot {
             aws: EmfAws {
-                Timestamp: timestamp_ms,
+                Timestamp: ts,
                 CloudWatchMetrics: vec![EmfMetricDirective {
-                    Namespace: namespace_str,
+                    Namespace: item.metric_namespace().to_string(),
                     Dimensions: vec![dims_keys],
-                    Metrics: vec![metric_def],
+                    Metrics: vec![EmfMetricDefinition {
+                        Name: item.metric_name().to_string(),
+                        Unit: item.metric_unit().to_string(),
+                    }],
                 }],
             },
-            payload: base,
+            payload,
         };
 
-        // Serialize and send as a single event.
         let message = serde_json::to_string(&emf).map_err(|e| {
             CloudWatchInvalidOperation::with_debug("failed to serialize EMF log", &e)
         })?;
-
-        let stream_name = match self.config.stream_naming {
-            StreamNaming::Date => self.compute_stream_name(),
-            StreamNaming::Uuid => {
-                if self.uuid_stream_name.is_none() {
-                    self.uuid_stream_name = Some(self.compute_stream_name());
-                }
-                self.uuid_stream_name.clone().unwrap()
-            }
-        };
-
-        self.ensure_stream(&stream_name).await?;
-
         let event = InputLogEvent::builder()
             .message(message)
-            .timestamp(timestamp_ms)
-            .build();
+            .timestamp(ts)
+            .build()
+            .map_err(|e| {
+                CloudWatchInvalidOperation::with_debug("failed to build EMF log event", &e)
+            })?;
 
-        let mut sequence_token = self.fetch_sequence_token(&stream_name).await?;
-        let attempt = self
-            .backend
+        self.backend
             .put_log_events(
                 self.config.log_group.clone(),
-                stream_name.clone(),
-                vec![event.clone()],
-                sequence_token.clone(),
+                self.stream_name.clone(),
+                vec![event],
             )
-            .await;
-
-        match attempt {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("InvalidSequenceToken") || err_str.contains("DataAlreadyAccepted") {
-                    sequence_token = self.fetch_sequence_token(&stream_name).await?;
-                    self
-                        .backend
-                        .put_log_events(
-                            self.config.log_group.clone(),
-                            stream_name,
-                            vec![event],
-                            sequence_token,
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|e2| CloudWatchCalloutError::with_debug("failed to put EMF log (retry)", &e2))
-                } else {
-                    Err(CloudWatchCalloutError::with_debug("failed to put EMF log", &e))
-                }
-            }
-        }
+            .await
+            .map_err(|e| CloudWatchCalloutError::with_debug("failed to put EMF log", &e))?;
+        Ok(())
     }
+}
+
+// Helpers.
+// ---------------------------------------------------------------------------
+
+/// Checks the log group exists, and creates a log stream if not already
+/// present. Returns the log stream name.
+async fn ensure_stream<T>(
+    backend: &dyn LogsBackend,
+    config: &LogConfig<T>,
+) -> Result<String, ServerError> {
+    let stream_name = match config.stream_naming {
+        StreamNaming::Date => chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        StreamNaming::Uuid => uuid::Uuid::new_v4().to_string(),
+    };
+
+    let search_result = backend
+        .describe_log_stream(config.log_group.clone(), stream_name.clone())
+        .await
+        .map_err(|e| match e {
+            SdkError::ServiceError(se) => match se.err() {
+                DescribeLogStreamsError::ResourceNotFoundException(_) => {
+                    LogGroupNotFound::new(&config.log_group)
+                }
+                _ => CloudWatchCalloutError::with_debug("failed to describe log stream", &se.err()),
+            },
+            other => CloudWatchCalloutError::with_debug("failed to describe log stream", &other),
+        })?;
+
+    let exists = search_result
+        .log_streams()
+        .iter()
+        .any(|s| s.log_stream_name() == Some(&stream_name));
+    if !exists {
+        match backend
+            .create_log_stream(config.log_group.clone(), stream_name.clone())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(SdkError::ServiceError(se)) => match se.err() {
+                CreateLogStreamError::ResourceNotFoundException(_) => {
+                    Err(CriticalError::new(&format!(
+                        "log group '{}' not found, despite checking existence above",
+                        config.log_group
+                    )))
+                }
+                CreateLogStreamError::ResourceAlreadyExistsException(_) => {
+                    // Benign race; stream is there now.
+                    Ok(())
+                }
+                _ => Err(CloudWatchCalloutError::with_debug(
+                    "failed to create log stream",
+                    &se.err(),
+                )),
+            },
+            Err(other) => Err(CloudWatchCalloutError::with_debug(
+                "failed to create log stream",
+                &other,
+            )),
+        }?;
+    }
+
+    Ok(stream_name)
 }

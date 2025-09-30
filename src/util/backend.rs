@@ -36,7 +36,6 @@ pub trait LogsBackend: Send + Sync {
         log_group: String,
         log_stream: String,
         events: Vec<InputLogEvent>,
-        sequence_token: Option<String>,
     ) -> Result<PutLogEventsOutput, SdkError<PutLogEventsError>>;
 }
 
@@ -72,12 +71,10 @@ impl LogsBackend for aws_sdk_cloudwatchlogs::Client {
         log_group: String,
         log_stream: String,
         events: Vec<InputLogEvent>,
-        sequence_token: Option<String>,
     ) -> Result<PutLogEventsOutput, SdkError<PutLogEventsError>> {
         self.put_log_events()
             .log_group_name(log_group)
             .log_stream_name(log_stream)
-            .set_sequence_token(sequence_token)
             .set_log_events(Some(events))
             .send()
             .await
@@ -87,15 +84,13 @@ impl LogsBackend for aws_sdk_cloudwatchlogs::Client {
 // Register dependency, default to real AWS backend.
 // --------------------------------------------------
 
-register_ctx_singleton!(
+register_ctx_singleton!(dyn LogsCtxView, dyn LogsBackend, |ctx: Arc<
     dyn LogsCtxView,
-    dyn LogsBackend,
-    |ctx: Arc<dyn LogsCtxView>| async move {
-        let region = Region::new(ctx.log_region().clone());
-        let shared_config = aws_config::defaults(BehaviorVersion::v2025_08_07())
-            .region(region)
-            .load()
-            .await;
-        Ok(aws_sdk_cloudwatchlogs::Client::new(&shared_config))
-    }
-);
+>| async move {
+    let region = Region::new(ctx.log_region().clone());
+    let shared_config = aws_config::defaults(BehaviorVersion::v2025_08_07())
+        .region(region)
+        .load()
+        .await;
+    Ok(aws_sdk_cloudwatchlogs::Client::new(&shared_config))
+});
