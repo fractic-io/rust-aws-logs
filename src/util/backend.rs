@@ -88,7 +88,7 @@ register_ctx_singleton!(dyn LogsCtxView, dyn LogsBackend, |ctx: Arc<
     dyn LogsCtxView,
 >| async move {
     let region = Region::new(ctx.log_region().clone());
-    let shared_config = aws_config::defaults(BehaviorVersion::v2026_01_12())
+    let shared_config = aws_config::defaults(BehaviorVersion::latest())
         .region(region)
         .load()
         .await;
