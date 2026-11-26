@@ -19,8 +19,8 @@ use fractic_server_error::{CriticalError, ServerError};
 pub mod backend;
 use backend::LogsBackend;
 
-/// Configuration.
-/// --------------------------------------------------------------------------
+// Configuration.
+// -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum StreamNaming {
@@ -45,8 +45,8 @@ impl<T> LogConfig<T> {
     }
 }
 
-/// Extensions.
-/// --------------------------------------------------------------------------
+// Extensions.
+// -----------------------------------------------------------------------------
 
 /// Implement on T to enable EMF logging.
 pub trait MetricExport {
@@ -57,8 +57,8 @@ pub trait MetricExport {
     fn metric_value(&self) -> f64;
 }
 
-/// Implementation.
-/// --------------------------------------------------------------------------
+// Implementation.
+// -----------------------------------------------------------------------------
 
 pub struct LogsUtil<T: Serialize + Send + Sync> {
     pub backend: Arc<dyn LogsBackend>,
